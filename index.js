@@ -4,57 +4,6 @@ var async = require('async');
 var address = 0x76;
 var sensor = new i2c(address, {device: '/dev/i2c-1'});
 
-//  stanby
-//    0.5ms : 0
-//    62.5ms: 1
-//    125ms : 2
-//    250ms : 3
-//    500ms : 4
-//    1000ms: 5
-//    10ms  : 6
-//    20ms  : 7
-//  os_t
-//    skip  : 0
-//    x1    : 1
-//    x2    : 2
-//    x4    : 3
-//    x8    : 4
-//    x16   : 5
-//  os_p
-//    skip  : 0
-//    x1    : 1
-//    x2    : 2
-//    x4    : 3
-//    x8    : 4
-//    x16   : 5
-//  mode
-//    sleep : 0
-//    force : 1, 2
-//    normal: 3
-function initialize(stanby, os_t, os_p, mode, callback){
-  //  filter
-  //    off : 0
-  //    2   : 1
-  //    4   : 2
-  //    8   : 3
-  //    16  : 4
-  var filter = 0;
-  // spi3w = 0;(i2cだから)
-  var spi3w = 0;
-
-  var config = (stanby&0x7) << 5 | (filter&0x7) << 2 | (spi3w&0x1);
-  var control = (os_t&0x7) << 5 | (os_p&0x7) << 2 | (mode&0x3);
-
-  async.parallel([
-      function(cb){
-        sensor.writeBytes(0xf5, [config], function(){cb()});
-      },
-      function(cb){
-        sensor.writeBytes(0xf4, [control], function(){cb()});
-      },
-    ], function(){ callback() });
-}
-
 function getCalibrationData(callback){
   var c = {};
   async.series([
@@ -152,9 +101,9 @@ function calibrateH(hr, t_base, c){
   ch.push( ( (c[0xe5]&0xf0) >> 4 ) | ( c[0xe6] << 4 ) );
   ch.push( c[0xe7] );
 
-  for(var i in [1, 3, 4]){
-    ch[i] = ushort2Short(ch[i]);
-  }
+  ch[1] = ushort2Short(ch[1]);
+  ch[3] = ushort2Short(ch[3]);
+  ch[4] = ushort2Short(ch[4]);
   ch[5] = uchar2Char(ch[5]);
 
   var humi;
@@ -174,19 +123,19 @@ function calibrateH(hr, t_base, c){
 function readRawData(callback){
   async.waterfall([
       function(cb){
-        var raw = [];
+        var raw = {};
         sensor.readBytes(0xf7, 8, function(e, val){
           for(var i = 0, len = val.length; i < len; i++){
-            raw.push(val[i]);
+            raw[0xf7+i] = val[i];
           }
           cb(null, raw);
         })
       },
       function(raw, cb){
         var raws = {
-          t: raw[3] << 12 | raw[4] << 4 | raw[5] >> 4,
-          p: raw[0] << 12 | raw[1] << 4 | raw[2] >> 4,
-          h: raw[6] << 8 | raw[7]
+          t: (raw[0xfa] << 12) | (raw[0xfb] << 4) | ((0xf0&raw[0xfc]) >> 4),
+          p: (raw[0xf7] << 12) | (raw[0xf8] << 4) | ((0xf0&raw[0xf9]) >> 4),
+          h: (raw[0xfd] << 8) | raw[0xfe]
         };
         cb(null, raws);
       }
@@ -195,21 +144,91 @@ function readRawData(callback){
   });
 }
 
-var calib = null;
-async.series([
-    function(cb){
-      initialize(5, 1, 1, 3, function(){cb();});
-    },
-    function(cb){
-      getCalibrationData(function(val){
-        calib = val;
-        cb();
-      });
-    }
-]);
+function init(cb){
+  //  stanby
+  //    0.5ms : 0
+  //    62.5ms: 1
+  //    125ms : 2
+  //    250ms : 3
+  //    500ms : 4
+  //    1000ms: 5
+  //    10ms  : 6
+  //    20ms  : 7
+  //  os_t
+  //    skip  : 0
+  //    x1    : 1
+  //    x2    : 2
+  //    x4    : 3
+  //    x8    : 4
+  //    x16   : 5
+  //  os_p
+  //    skip  : 0
+  //    x1    : 1
+  //    x2    : 2
+  //    x4    : 3
+  //    x8    : 4
+  //    x16   : 5
+  //  os_h
+  //    skip  : 0
+  //    x1    : 1
+  //    x2    : 2
+  //    x4    : 3
+  //    x8    : 4
+  //    x16   : 5
+  //  mode
+  //    sleep : 0
+  //    force : 1, 2
+  //    normal: 3
+  //  filter
+  //    off : 0
+  //    2   : 1
+  //    4   : 2
+  //    8   : 3
+  //    16  : 4
+  var stanby = 3,
+    os_t = 1,
+    os_p = 1,
+    os_h = 1,
+    mode = 2,
+    filter = 0;
+  
+  // spi3w = 0;(i2cだから)
+  var spi3w = 0;
 
-setInterval(function(){
+  var config = (stanby&0x7) << 5 | (filter&0x7) << 2 | (spi3w&0x1);
+  var ctrl_meas = (os_t&0x7) << 5 | (os_p&0x7) << 2 | (mode&0x3);
+  var ctrl_hum = mode&0x7;
+  var ostn = (os_t != 0) ? Math.pow(2, os_t - 1) : 0;
+  var ospn = (os_p != 0) ? Math.pow(2, os_p - 1) : 0;
+  var oshn = (os_h != 0) ? Math.pow(2, os_h - 1) : 0;
+
+  var wait_time = Math.ceil(1.25 + (2.3 * ostn) + (2.3 * ospn + 0.575) + (2.3 * oshn + 0.575));
+
+  async.series([
+      function(cb){
+        sensor.writeBytes(0xf5, [config], function(){cb()});
+      },
+      function(cb){
+        sensor.writeBytes(0xf4, [ctrl_meas], function(){cb()});
+      },
+      function(cb){
+        sensor.writeBytes(0xf2, [ctrl_hum], function(){cb()});
+      }
+  ], function(){cb(null, wait_time)});
+}
+
+function triggerForce(cb){
+  sensor.writeBytes(0xf4, [2], function(){cb()});
+}
+
+function measure(){
   async.waterfall([
+      function(cb){
+        init(cb)
+      },
+      function(time, cb){
+        setTimeout(cb, time);
+      },
       function(cb){
         readRawData(function(raws){
           cb(null, raws);
@@ -220,11 +239,24 @@ setInterval(function(){
         var temp = calibrateT(tbase, calib);
         var pres = calibrateP(raws.p, tbase, calib);
         var humi = calibrateH(raws.h, tbase, calib);
-        console.log('temp:' + (temp/100.0));
-        console.log('pres:' + (pres/100.0));
-        console.log('humi:' + (humi));
-        console.log('');
+        //console.log((new Date()).toTimeString());
+        //console.log(Date.now());
+        //console.log('temp:' + (temp/100.0));
+        //console.log('pres:' + (pres/100.0));
+        //console.log('humi:' + (humi));
+        console.log(Date.now()+','+(temp/100.0)+','+(pres/100.0)+','+humi);
+        //console.log('');
         cb();
       }
   ]);
-},1000);
+}
+
+var calib = null;
+getCalibrationData(function(val){
+  calib = val;
+});
+
+init(function(){
+  measure();
+  setInterval(measure,60000);
+});
